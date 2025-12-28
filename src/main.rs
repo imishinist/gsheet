@@ -9,6 +9,7 @@ use google_sheets4::yup_oauth2::ServiceAccountAuthenticator;
 use serde_json::Value;
 use thiserror::Error;
 
+use std::env;
 use std::io;
 use std::path::PathBuf;
 
@@ -31,13 +32,6 @@ enum ParseError {
         col: usize,
         name: String,
     },
-
-    #[error("row {row}, col {col}: validation error: {message}")]
-    ValidationError {
-        row: usize,
-        col: usize,
-        message: String,
-    },
 }
 
 #[derive(Debug, Error)]
@@ -53,6 +47,9 @@ enum AppError {
 
     #[error(transparent)]
     WriteError(#[from] csv::Error),
+
+    #[error("service account credentials not found. Provide --service-account-file or set GOOGLE_APPLICATION_CREDENTIALS")]
+    MissingCredentials,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -62,6 +59,7 @@ enum OnError {
     Log,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum DataType {
     String,
@@ -228,7 +226,8 @@ async fn main() -> Result<(), AppError> {
 
     let service_account_file = cli
         .service_account_file
-        .expect("service account file is required");
+        .or_else(|| env::var("GOOGLE_APPLICATION_CREDENTIALS").ok().map(PathBuf::from))
+        .ok_or(AppError::MissingCredentials)?;
     let creds = yup_oauth2::read_service_account_key(service_account_file).await?;
     let auth = ServiceAccountAuthenticator::builder(creds).build().await?;
     let hub = Sheets::new(
