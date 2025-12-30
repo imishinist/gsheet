@@ -48,8 +48,13 @@ enum AppError {
     #[error(transparent)]
     WriteError(#[from] csv::Error),
 
-    #[error("service account credentials not found. Provide --service-account-file or set GOOGLE_APPLICATION_CREDENTIALS")]
+    #[error(
+        "service account credentials not found. Provide --service-account-file or set GOOGLE_APPLICATION_CREDENTIALS"
+    )]
     MissingCredentials,
+
+    #[error("data not found")]
+    DataNotFound,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -93,7 +98,7 @@ impl DataValue {
 struct Record(Vec<DataValue>);
 
 impl Record {
-    fn iter(&self) -> impl Iterator<Item = &DataValue> {
+    fn iter_column(&self) -> impl Iterator<Item = &DataValue> {
         self.0.iter()
     }
 }
@@ -226,7 +231,11 @@ async fn main() -> Result<(), AppError> {
 
     let service_account_file = cli
         .service_account_file
-        .or_else(|| env::var("GOOGLE_APPLICATION_CREDENTIALS").ok().map(PathBuf::from))
+        .or_else(|| {
+            env::var("GOOGLE_APPLICATION_CREDENTIALS")
+                .ok()
+                .map(PathBuf::from)
+        })
         .ok_or(AppError::MissingCredentials)?;
     let creds = yup_oauth2::read_service_account_key(service_account_file).await?;
     let auth = ServiceAccountAuthenticator::builder(creds).build().await?;
@@ -241,48 +250,47 @@ async fn main() -> Result<(), AppError> {
         auth,
     );
 
-    let result = hub
+    let (_, value_range) = hub
         .spreadsheets()
         .values_get(&cli.sheet_id, &cli.range)
         .doit()
         .await?;
 
-    let (_, value_range) = result;
-    if let Some(values) = value_range.values {
-        let mut iter = values.into_iter().enumerate().peekable();
+    let mut iter = value_range
+        .values
+        .ok_or(AppError::DataNotFound)?
+        .into_iter()
+        .enumerate()
+        .peekable();
 
-        if let Some((_, header)) = iter.peek() {
-            let schema;
-            if cli.has_header {
-                schema = generate_schema(header);
-                iter.next();
-            } else {
-                schema = generate_default_schema(header.len());
-            };
-            if cli.output_header {
-                wtr.write_record(schema.columns.iter().map(|c| &c.name))?;
-            }
-
-            for (i, raw_row) in iter {
-                match schema.parse_row(i, raw_row) {
-                    Ok(record) => {
-                        let csv_row: Vec<String> =
-                            record.iter().map(|v| v.to_csv_string()).collect();
-                        wtr.write_record(csv_row)?;
-                    }
-                    Err(e) => match cli.on_error {
-                        OnError::Fail => return Err(e.into()),
-                        OnError::Skip => continue,
-                        OnError::Log => eprintln!("{:?}", e),
-                    },
-                }
-            }
-        } else {
-            eprintln!("data not found");
-        }
+    // header
+    let (_, header) = iter.peek().ok_or(AppError::DataNotFound)?;
+    let schema;
+    if cli.has_header {
+        schema = generate_schema(header);
+        iter.next();
     } else {
-        eprintln!("data not found");
+        schema = generate_default_schema(header.len());
+    };
+    if cli.output_header {
+        wtr.write_record(schema.columns.iter().map(|c| &c.name))?;
     }
+
+    for (i, raw_row) in iter {
+        match schema.parse_row(i, raw_row) {
+            Ok(record) => {
+                let csv_row: Vec<String> =
+                    record.iter_column().map(DataValue::to_csv_string).collect();
+                wtr.write_record(csv_row)?;
+            }
+            Err(e) => match cli.on_error {
+                OnError::Fail => return Err(e.into()),
+                OnError::Skip => continue,
+                OnError::Log => eprintln!("{:?}", e),
+            },
+        }
+    }
+
     wtr.flush()?;
 
     Ok(())
